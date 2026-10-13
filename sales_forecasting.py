@@ -1,54 +1,50 @@
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-
-# Load dataset
-df = pd.read_csv("train.csv")
-
-# Convert date column
-df["date"] = pd.to_datetime(df["date"])
-
-# Total sales per day
-daily_sales = df.groupby("date")["sales"].sum().reset_index()
-
-print(daily_sales.head())
-print("Total days:", len(daily_sales))
-
-# Plot historical sales
-plt.figure(figsize=(12, 5))
-plt.plot(daily_sales["date"], daily_sales["sales"])
-plt.title("Historical Daily Sales")
-plt.xlabel("Date")
-plt.ylabel("Total Sales")
-plt.tight_layout()
-plt.savefig("sales_trend.png")
-plt.show()
-
-
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import numpy as np
 
-# Create time-based features
-daily_sales["day"] = daily_sales["date"].dt.day
-daily_sales["month"] = daily_sales["date"].dt.month
-daily_sales["year"] = daily_sales["date"].dt.year
-daily_sales["day_of_week"] = daily_sales["date"].dt.dayofweek
-daily_sales["lag_7"] = daily_sales["sales"].shift(7)
-daily_sales["lag_14"] = daily_sales["sales"].shift(14)
+# Load data
+df = pd.read_csv("train.csv")
+df["date"] = pd.to_datetime(df["date"])
 
-daily_sales = daily_sales.dropna().reset_index(drop=True)
+# Aggregate sales by date
+daily = df.groupby("date")["sales"].sum().sort_index()
 
-# Chronological train-test split
-split = int(len(daily_sales) * 0.8)
-train = daily_sales.iloc[:split]
-test = daily_sales.iloc[split:]
+# Create forecasting features
+def make_features(date, history):
+    return [
+        date.day,
+        date.month,
+        date.year,
+        date.dayofweek,
+        date.dayofyear,
+        history[-1],
+        history[-7],
+        history[-14],
+        np.mean(history[-7:])
+    ]
 
-features = ["day", "month", "year", "day_of_week", "lag_7", "lag_14"]
+X, y = [], []
 
-X_train = train[features]
-y_train = train["sales"]
-X_test = test[features]
-y_test = test["sales"]
+for i in range(14, len(daily)):
+    date = daily.index[i]
+    history = daily.iloc[:i].tolist()
+    X.append(make_features(date, history))
+    y.append(daily.iloc[i])
+
+feature_names = [
+    "day", "month", "year", "day_of_week", "day_of_year",
+    "lag_1", "lag_7", "lag_14", "rolling_mean_7"
+]
+
+X = pd.DataFrame(X, columns=feature_names)
+y = np.array(y)
+
+# Chronological split
+split = int(len(X) * 0.8)
+X_train, X_test = X.iloc[:split], X.iloc[split:]
+y_train, y_test = y[:split], y[split:]
 
 # Train model
 model = RandomForestRegressor(
@@ -58,33 +54,94 @@ model = RandomForestRegressor(
 )
 model.fit(X_train, y_train)
 
-# Evaluate model
-predictions = model.predict(X_test)
+# Recursive evaluation on future test period
+history = daily.iloc[:split + 14].tolist()
+test_dates = daily.index[split + 14:]
+predictions = []
 
-mae = mean_absolute_error(y_test, predictions)
-rmse = np.sqrt(mean_squared_error(y_test, predictions))
+for date in test_dates:
+    features = pd.DataFrame(
+        [make_features(date, history)],
+        columns=feature_names
+    )
+    pred = max(0, model.predict(features)[0])
+    predictions.append(pred)
+    history.append(pred)
 
-print("Mean Absolute Error (MAE):", round(mae, 2))
-print("Root Mean Squared Error (RMSE):", round(rmse, 2))
+# Evaluation
+actual = daily.loc[test_dates].to_numpy()
+mae = mean_absolute_error(actual, predictions)
+rmse = np.sqrt(mean_squared_error(actual, predictions))
 
-# Plot actual vs predicted sales
+print("MAE:", round(mae, 2))
+print("RMSE:", round(rmse, 2))
+
+results = pd.DataFrame({
+    "Date": test_dates,
+    "Actual_Sales": actual,
+    "Predicted_Sales": predictions
+})
+results.to_csv("forecast_results.csv", index=False)
+
+# Plot evaluation results
 plt.figure(figsize=(12, 5))
-plt.plot(test["date"], y_test, label="Actual Sales")
-plt.plot(test["date"], predictions, label="Predicted Sales")
-plt.title("Actual vs Predicted Daily Sales")
+plt.plot(test_dates, actual, label="Actual Sales")
+plt.plot(test_dates, predictions, label="Forecast Sales")
+plt.title("Actual vs Forecast Sales")
 plt.xlabel("Date")
-plt.ylabel("Total Sales")
+plt.ylabel("Sales")
 plt.legend()
 plt.tight_layout()
 plt.savefig("sales_forecast.png")
-plt.show()
+plt.close()
 
-results = pd.DataFrame({
-    "Date": test["date"].values,
-    "Actual_Sales": y_test.values,
-    "Predicted_Sales": predictions
+# Historical sales plot
+plt.figure(figsize=(12, 5))
+plt.plot(daily.index, daily.values)
+plt.title("Historical Daily Sales")
+plt.xlabel("Date")
+plt.ylabel("Sales")
+plt.tight_layout()
+plt.savefig("sales_trend.png")
+plt.close()
+
+# Retrain on all available historical data
+model.fit(X, y)
+
+# Forecast next 16 days
+history = daily.tolist()
+future_dates = pd.date_range(
+    start=daily.index[-1] + pd.Timedelta(days=1),
+    periods=16,
+    freq="D"
+)
+future_predictions = []
+
+for date in future_dates:
+    features = pd.DataFrame(
+        [make_features(date, history)],
+        columns=feature_names
+    )
+    pred = max(0, model.predict(features)[0])
+    future_predictions.append(pred)
+    history.append(pred)
+
+future = pd.DataFrame({
+    "Date": future_dates,
+    "Forecast_Sales": future_predictions
 })
+future.to_csv("future_forecast.csv", index=False)
 
-results.to_csv("forecast_results.csv", index=False)
+plt.figure(figsize=(12, 5))
+plt.plot(daily.index[-60:], daily.values[-60:], label="Historical Sales")
+plt.plot(future_dates, future_predictions, marker="o", label="Future Forecast")
+plt.title("Sales Forecast for the Next 16 Days")
+plt.xlabel("Date")
+plt.ylabel("Sales")
+plt.legend()
+plt.tight_layout()
+plt.savefig("future_forecast.png")
+plt.close()
 
-print("Forecast results saved successfully!")
+print("All results and charts saved successfully!")
+print(future)
